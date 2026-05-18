@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import obd
-from dash import Dash, html, dcc, Input, Output, State, ctx, no_update
+from dash import Dash, html, dcc, Input, Output, ctx
 
 PORT = "COM11"
 BAUDRATE = 38400
@@ -25,6 +25,7 @@ connection = None
 vin_value = "VIN unavailable"
 session_started_at = None
 session_active = False
+session_enabled = False
 
 
 def connect_adapter():
@@ -44,7 +45,7 @@ def connect_adapter():
 
 
 def restart_adapter_session():
-    global connection, history, vin_value, session_started_at, session_active
+    global connection, history, vin_value, session_started_at, session_active, session_enabled
 
     try:
         if connection is not None:
@@ -56,8 +57,24 @@ def restart_adapter_session():
     vin_value = "VIN unavailable"
     session_started_at = None
     session_active = False
+    session_enabled = False
 
     connect_adapter()
+
+
+def start_session():
+    global history, session_started_at, session_active, session_enabled
+
+    history = []
+    session_started_at = None
+    session_active = False
+    session_enabled = True
+
+
+def stop_session():
+    global session_active, session_enabled
+    session_active = False
+    session_enabled = False
 
 
 def is_connected():
@@ -264,9 +281,6 @@ def append_sample_to_csv(now, sample):
 
 
 def ignition_or_engine_ready(sample):
-    """
-    Decide whether the ECU is giving enough real data to start the session.
-    """
     if sample is None:
         return False
 
@@ -318,6 +332,20 @@ app.layout = html.Div(
                 html.Div(
                     [
                         html.Button(
+                            "Start Session",
+                            id="start-session-btn",
+                            n_clicks=0,
+                            className="profile-button",
+                            style={"marginRight": "12px"},
+                        ),
+                        html.Button(
+                            "Stop Session",
+                            id="stop-session-btn",
+                            n_clicks=0,
+                            className="profile-button",
+                            style={"marginRight": "12px"},
+                        ),
+                        html.Button(
                             "Restart Session / Reconnect Adapter",
                             id="restart-session-btn",
                             n_clicks=0,
@@ -352,12 +380,27 @@ app.layout = html.Div(
 
 @app.callback(
     Output("session-status", "children"),
+    Input("start-session-btn", "n_clicks"),
+    Input("stop-session-btn", "n_clicks"),
     Input("restart-session-btn", "n_clicks"),
     prevent_initial_call=True,
 )
-def restart_session(_):
-    restart_adapter_session()
-    return "Session restarted. Waiting for ignition/engine data..."
+def handle_session_buttons(_, __, ___):
+    triggered = ctx.triggered_id
+
+    if triggered == "start-session-btn":
+        start_session()
+        return "Session armed. Turn ignition on / start the car to begin live capture."
+
+    if triggered == "stop-session-btn":
+        stop_session()
+        return "Session stopped. Live capture paused."
+
+    if triggered == "restart-session-btn":
+        restart_adapter_session()
+        return "Session restarted. Press Start Session when ready."
+
+    return "Ready."
 
 
 @app.callback(
@@ -374,7 +417,7 @@ def restart_session(_):
     prevent_initial_call=True,
 )
 def update_dashboard(_):
-    global history, vin_value, session_started_at, session_active
+    global history, vin_value, session_started_at, session_active, session_enabled
 
     if not is_connected():
         vehicle_box = html.Div(
@@ -399,6 +442,29 @@ def update_dashboard(_):
         empty = build_empty_figure("No live connection")
         return vehicle_box, metrics, empty, empty, empty, empty, empty, empty, "Adapter disconnected."
 
+    if not session_enabled:
+        vehicle_box = html.Div(
+            [
+                html.Div("Vehicle", style={"fontWeight": "700", "marginBottom": "6px"}),
+                html.Div(CAR_LABEL, style={"fontSize": "22px", "fontWeight": "700"}),
+                html.Div(CAR_NAME, style={"marginTop": "6px"}),
+                html.Div(f"VIN: {vin_value}", style={"marginTop": "6px", "wordBreak": "break-all"}),
+                html.Div("Status: waiting to start", style={"marginTop": "8px", "color": "#ffd166", "fontSize": "13px"}),
+            ]
+        )
+
+        metrics = [
+            metric_card("Speed", "N/A", "#ff7a18"),
+            metric_card("RPM", "N/A", "#00c2ff"),
+            metric_card("Coolant", "N/A", "#ff4d6d"),
+            metric_card("Intake Air", "N/A", "#14b8a6"),
+            metric_card("Throttle", "N/A", "#8b5cf6"),
+            metric_card("Voltage", "N/A", "#ffd166"),
+        ]
+
+        empty = build_empty_figure("Press Start Session to begin")
+        return vehicle_box, metrics, empty, empty, empty, empty, empty, empty, "Press Start Session to begin polling."
+
     now = datetime.now()
     sample = get_sample()
 
@@ -414,27 +480,47 @@ def update_dashboard(_):
         session_active = True
         session_started_at = now
 
-    status_text = "Waiting for ignition/engine data..."
-    if session_active:
-        status_text = f"Session active since {session_started_at.strftime('%Y-%m-%d %H:%M:%S')}"
+    if not session_active:
+        empty = build_empty_figure("Waiting for ignition / engine data")
+        vehicle_box = html.Div(
+            [
+                html.Div("Vehicle", style={"fontWeight": "700", "marginBottom": "6px"}),
+                html.Div(CAR_LABEL, style={"fontSize": "22px", "fontWeight": "700"}),
+                html.Div(CAR_NAME, style={"marginTop": "6px"}),
+                html.Div(f"VIN: {vin_value}", style={"marginTop": "6px", "wordBreak": "break-all"}),
+                html.Div(
+                    "Status: armed, waiting for ignition/engine data",
+                    style={"marginTop": "8px", "color": "#ffd166", "fontSize": "13px"},
+                ),
+            ]
+        )
 
-    # Only log/store once the car is actually responding
-    if session_active:
-        row = {
-            "timestamp": now,
-            "speed": numeric_value(sample["speed"]),
-            "rpm": numeric_value(sample["rpm"]),
-            "coolant_temp": numeric_value(sample["coolant_temp"]),
-            "intake_air_temp": numeric_value(sample["intake_air_temp"]),
-            "throttle_pos": numeric_value(sample["throttle_pos"]),
-            "maf": numeric_value(sample["maf"]),
-            "engine_load": numeric_value(sample["engine_load"]),
-            "control_module_voltage": numeric_value(sample["control_module_voltage"]),
-        }
+        metrics = [
+            metric_card("Speed", format_metric("Speed", sample.get("speed")), "#ff7a18"),
+            metric_card("RPM", format_metric("RPM", sample.get("rpm")), "#00c2ff"),
+            metric_card("Coolant", format_metric("Coolant", sample.get("coolant_temp")), "#ff4d6d"),
+            metric_card("Intake Air", format_metric("Intake Air", sample.get("intake_air_temp")), "#14b8a6"),
+            metric_card("Throttle", format_metric("Throttle", sample.get("throttle_pos")), "#8b5cf6"),
+            metric_card("Voltage", format_metric("Voltage", sample.get("control_module_voltage")), "#ffd166"),
+        ]
 
-        history.append(row)
-        history = history[-MAX_POINTS:]
-        append_sample_to_csv(now, sample)
+        return vehicle_box, metrics, empty, empty, empty, empty, empty, empty, "Session armed. Waiting for ignition/engine response..."
+
+    row = {
+        "timestamp": now,
+        "speed": numeric_value(sample["speed"]),
+        "rpm": numeric_value(sample["rpm"]),
+        "coolant_temp": numeric_value(sample["coolant_temp"]),
+        "intake_air_temp": numeric_value(sample["intake_air_temp"]),
+        "throttle_pos": numeric_value(sample["throttle_pos"]),
+        "maf": numeric_value(sample["maf"]),
+        "engine_load": numeric_value(sample["engine_load"]),
+        "control_module_voltage": numeric_value(sample["control_module_voltage"]),
+    }
+
+    history.append(row)
+    history = history[-MAX_POINTS:]
+    append_sample_to_csv(now, sample)
 
     df = pd.DataFrame(history)
 
@@ -467,7 +553,17 @@ def update_dashboard(_):
     load_fig = styled_multi_chart(df, "timestamp", ["engine_load", "throttle_pos"], "Load & Throttle")
     voltage_fig = styled_line_chart(df, "timestamp", "control_module_voltage", "Control Module Voltage")
 
-    return vehicle_box, metrics, speed_fig, rpm_fig, temp_fig, air_fig, load_fig, voltage_fig, status_text
+    return (
+        vehicle_box,
+        metrics,
+        speed_fig,
+        rpm_fig,
+        temp_fig,
+        air_fig,
+        load_fig,
+        voltage_fig,
+        f"Session active since {session_started_at.strftime('%Y-%m-%d %H:%M:%S')}",
+    )
 
 
 if __name__ == "__main__":
